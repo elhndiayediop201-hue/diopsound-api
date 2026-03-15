@@ -10,26 +10,22 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Cache léger — juste les URLs et durées, pas les fichiers audio
 const audioCache = new Map();
 const artCache   = new Map();
 const CACHE_TTL  = 5 * 60 * 1000;
+const MAX_CACHE  = 50;
 
-// Limite la taille du cache pour éviter l'OOM
-const MAX_CACHE = 50;
-
-function setCache(map, key, value) {
-  if (map.size >= MAX_CACHE) {
-    // Supprimer la première entrée (la plus ancienne)
-    map.delete(map.keys().next().value);
-  }
-  map.set(key, value);
+function setCache(map, key, val) {
+  if (map.size >= MAX_CACHE) map.delete(map.keys().next().value);
+  map.set(key, val);
 }
 
+// ══════════════════════════════════════════
+//  HEALTH
+// ══════════════════════════════════════════
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok',
-    message: 'DiopSound API 🎵',
+    status: 'ok', message: 'DiopSound API 🎵',
     author: 'Elhadji Ndiaye Diop',
     cached: audioCache.size,
     memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
@@ -37,68 +33,88 @@ app.get('/health', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-//  RECHERCHE + pochettes iTunes
+//  RECHERCHE RAPIDE via YouTube Data API
+//  Résultats en < 1 seconde
 // ══════════════════════════════════════════
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'q manquant' });
 
-  const cmd = `yt-dlp "ytsearch15:${query}" --dump-json --flat-playlist --no-warnings --no-playlist --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
+  const YT_KEY = process.env.YT_API_KEY || 'AIzaSyB3KyzbGd86QzVa2mt8x7HJ8bTaSN1bwcw';
 
-  exec(cmd, { timeout: 45000, maxBuffer: 5 * 1024 * 1024 }, async (err, stdout) => {
-    if (err || !stdout.trim()) return res.status(500).json({ error: 'Recherche échouée' });
+  try {
+    // 1. Recherche YouTube → instantanée
+    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(query)}&type=video&videoCategoryId=10&maxResults=15&key=${YT_KEY}`;
+    const searchData = await fetchJson(searchUrl);
 
-    try {
-      const results = stdout.trim().split('\n').filter(Boolean).map(line => {
-        try {
-          const item = JSON.parse(line);
-          return {
-            id: item.id, title: item.title,
-            artist: item.uploader || item.channel || '',
-            duration: formatDuration(item.duration || 0),
-            durationSec: item.duration || 0,
-            thumbnail: `https://img.youtube.com/vi/${item.id}/hqdefault.jpg`,
-            youtubeId: item.id,
-          };
-        } catch (e) { return null; }
-      }).filter(t => t && t.durationSec > 30 && t.durationSec < 7200);
+    if (!searchData.items?.length) {
+      return res.json({ status: 'success', results: [] });
+    }
 
-      // Enrichir pochettes iTunes en parallèle (limité à 8 pour économiser mémoire)
-      const enriched = await Promise.all(results.slice(0, 8).map(async track => {
-        const art = await getItunesArtwork(track.title, track.artist);
-        return { ...track, thumbnail: art || track.thumbnail };
+    // 2. Durées en parallèle
+    const ids = searchData.items.map(i => i.id.videoId).join(',');
+    const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${ids}&key=${YT_KEY}`;
+    const detailsData = await fetchJson(detailsUrl);
+    const durations = {};
+    (detailsData.items || []).forEach(item => {
+      durations[item.id] = parseDuration(item.contentDetails.duration);
+    });
+
+    // 3. Formater résultats
+    const results = searchData.items
+      .filter(item => {
+        const dur = durations[item.id.videoId] || 0;
+        return dur > 30 && dur < 7200;
+      })
+      .map(item => ({
+        id:          item.id.videoId,
+        title:       cleanTitle(item.snippet.title),
+        artist:      item.snippet.channelTitle.replace(' - Topic','').replace('VEVO','').trim(),
+        duration:    formatDuration(durations[item.id.videoId] || 0),
+        durationSec: durations[item.id.videoId] || 0,
+        thumbnail:   item.snippet.thumbnails.high?.url || item.snippet.thumbnails.default?.url,
+        youtubeId:   item.id.videoId,
       }));
 
-      // Garder les titres sans pochette tels quels
-      const final = [...enriched, ...results.slice(8)];
+    // 4. Pochettes iTunes + pré-cache audio EN PARALLÈLE
+    const [enriched] = await Promise.all([
+      Promise.all(results.slice(0, 8).map(async t => ({
+        ...t,
+        thumbnail: (await getItunesArtwork(t.title, t.artist)) || t.thumbnail,
+      }))),
+      // Pré-cache les 5 premiers immédiatement
+      ...results.slice(0, 5).map(t => prefetchAudio(t.id)),
+    ]);
 
-      // Pré-cacher les 3 premiers en arrière-plan
-      results.slice(0, 3).forEach(t => precacheAudio(t.id));
+    res.json({ status: 'success', results: [...enriched, ...results.slice(8)] });
 
-      res.json({ status: 'success', results: final });
-    } catch (e) {
-      res.status(500).json({ error: 'Parsing error' });
-    }
-  });
+  } catch (e) {
+    console.error('Search error:', e.message);
+    res.status(500).json({ error: 'Recherche échouée' });
+  }
 });
 
 // ══════════════════════════════════════════
-//  PRÉ-CACHE
+//  PRÉ-CACHE agressif — appelé par l'app
 // ══════════════════════════════════════════
 app.post('/precache', (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids manquant' });
-  // Limiter à 3 pour éviter surcharge mémoire
-  ids.slice(0, 3).forEach(id => precacheAudio(id));
-  res.json({ status: 'ok', queued: Math.min(ids.length, 3) });
+  ids.slice(0, 5).forEach(id => prefetchAudio(id));
+  res.json({ status: 'ok', queued: Math.min(ids.length, 5) });
 });
 
 // ══════════════════════════════════════════
-//  AUDIO INFO
+//  AUDIO INFO — durée + confirme le cache
 // ══════════════════════════════════════════
 app.get('/audio', (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'id manquant' });
+
+  const cached = audioCache.get(id);
+  if (cached && Date.now() - cached.time < CACHE_TTL) {
+    return res.json({ status: 'success', duration: cached.duration, id, cached: true });
+  }
 
   fetchAudioUrl(id, (err, url, duration) => {
     if (err || !url) return res.status(500).json({ error: 'Audio introuvable' });
@@ -107,8 +123,7 @@ app.get('/audio', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-//  STREAM — proxy direct sans buffer mémoire
-//  Utilise pipe() pour streamer chunk par chunk
+//  STREAM — proxy direct iOS compatible
 // ══════════════════════════════════════════
 app.get('/stream/:id', (req, res) => {
   const id = req.params.id;
@@ -126,39 +141,30 @@ app.get('/stream/:id', (req, res) => {
       headers: {
         'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
         'Accept': '*/*',
-        'Accept-Encoding': 'identity', // Pas de compression → moins de CPU
+        'Accept-Encoding': 'identity',
         ...(rangeHeader ? { 'Range': rangeHeader } : {}),
       },
     };
 
     const proxyReq = proto.get(options, (proxyRes) => {
-      // Headers minimaux pour iOS
       const headers = {
         'Content-Type': 'audio/mp4',
         'Accept-Ranges': 'bytes',
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'no-cache',
       };
-
       if (proxyRes.headers['content-length'])
         headers['Content-Length'] = proxyRes.headers['content-length'];
       if (proxyRes.headers['content-range'])
         headers['Content-Range'] = proxyRes.headers['content-range'];
 
       res.writeHead(proxyRes.statusCode || 200, headers);
-
-      // pipe() → stream direct sans buffer en mémoire ✅
       proxyRes.pipe(res, { end: true });
 
-      // Libérer mémoire si client déconnecté
-      req.on('close', () => {
-        proxyRes.destroy();
-        proxyReq.destroy();
-      });
+      req.on('close', () => { proxyRes.destroy(); proxyReq.destroy(); });
     });
 
-    proxyReq.on('error', (e) => {
-      console.error('Proxy error:', e.message);
+    proxyReq.on('error', e => {
       if (!res.headersSent) res.status(500).json({ error: 'Proxy error' });
     });
 
@@ -196,7 +202,8 @@ function fetchAudioUrl(id, callback) {
   });
 }
 
-function precacheAudio(id) {
+// Pré-fetch silencieux
+function prefetchAudio(id) {
   if (!id) return;
   const cached = audioCache.get(id);
   if (cached && Date.now() - cached.time < CACHE_TTL) return;
@@ -230,29 +237,37 @@ function fetchJson(url) {
       });
     });
     req.on('error', reject);
-    req.setTimeout(5000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
   });
 }
 
-function formatDuration(secs) {
-  if (!secs) return '0:00';
-  return `${Math.floor(secs/60)}:${Math.floor(secs%60).toString().padStart(2,'0')}`;
+function cleanTitle(t) {
+  return t.replace(/\(Official.*?\)/gi,'').replace(/\[Official.*?\]/gi,'')
+          .replace(/\(Audio.*?\)/gi,'').replace(/\(Lyrics.*?\)/gi,'')
+          .replace(/\(Video.*?\)/gi,'').replace(/- Official.*$/gi,'').trim();
 }
 
-// Nettoyer le cache toutes les 10 minutes pour libérer mémoire
+function parseDuration(iso) {
+  if (!iso) return 0;
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  return (parseInt(m[1]||0)*3600)+(parseInt(m[2]||0)*60)+parseInt(m[3]||0);
+}
+
+function formatDuration(s) {
+  if (!s) return '0:00';
+  return `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,'0')}`;
+}
+
+// Nettoyage mémoire
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of audioCache.entries()) {
     if (now - v.time > CACHE_TTL) audioCache.delete(k);
   }
-}, 10 * 60 * 1000);
-
-// Forcer garbage collection si disponible
-setInterval(() => {
   if (global.gc) global.gc();
-}, 5 * 60 * 1000);
+}, 10 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`🎵 DiopSound API - Elhadji Ndiaye Diop - Port ${PORT}`);
-  console.log(`   Memory: ${Math.round(process.memoryUsage().heapUsed/1024/1024)}MB`);
 });
