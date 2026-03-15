@@ -1,5 +1,5 @@
 const express = require('express');
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const cors = require('cors');
 
 const app = express();
@@ -8,11 +8,15 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Cache pour éviter de rappeler yt-dlp pour le même titre
+const cache = new Map();
+const CACHE_TTL = 4 * 60 * 1000; // 4 minutes (URLs YouTube expirent en ~6min)
+
 // ══════════════════════════════════════════
 //  HEALTH CHECK
 // ══════════════════════════════════════════
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'DiopSound API fonctionne 🎵', author: 'Elhadji Ndiaye Diop' });
+  res.json({ status: 'ok', message: 'DiopSound API 🎵', author: 'Elhadji Ndiaye Diop' });
 });
 
 // ══════════════════════════════════════════
@@ -40,7 +44,7 @@ app.get('/search', (req, res) => {
               artist:      item.uploader || item.channel || '',
               duration:    formatDuration(item.duration || 0),
               durationSec: item.duration || 0,
-              thumbnail:   item.thumbnail || `https://img.youtube.com/vi/${item.id}/hqdefault.jpg`,
+              thumbnail:   `https://img.youtube.com/vi/${item.id}/hqdefault.jpg`,
               youtubeId:   item.id,
             };
           } catch (e) { return null; }
@@ -54,81 +58,53 @@ app.get('/search', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-//  STREAM URL — retourne l'URL directe
+//  AUDIO — retourne URL directe + durée exacte
+//  Beaucoup plus rapide que le proxy
 // ══════════════════════════════════════════
-app.get('/stream', (req, res) => {
+app.get('/audio', (req, res) => {
   const id = req.query.id;
-  if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
+  if (!id) return res.status(400).json({ error: 'id manquant' });
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f "140/bestaudio[ext=m4a]/bestaudio[ext=mp4]" --get-url --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
+  // Vérifier le cache d'abord
+  const cached = cache.get(id);
+  if (cached && Date.now() - cached.time < CACHE_TTL) {
+    return res.json({ status: 'success', url: cached.url, duration: cached.duration, id, cached: true });
+  }
+
+  // Récupérer URL + durée exacte en une seule commande
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
+    -f "140/bestaudio[ext=m4a]/bestaudio[ext=mp4]" \
+    --print "%(url)s|||%(duration)s" \
+    --no-warnings \
+    --extractor-args "youtube:player_client=android_vr" \
+    2>/dev/null`;
 
   exec(cmd, { timeout: 45000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
-      return res.status(500).json({ error: 'Stream introuvable' });
-    }
-    const url = stdout.trim().split('\n')[0];
-    res.json({ status: 'success', url, id });
-  });
-});
+      // Fallback android client
+      const cmd2 = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
+        -f "140/bestaudio[ext=m4a]/bestaudio[ext=mp4]" \
+        --print "%(url)s|||%(duration)s" \
+        --no-warnings \
+        --extractor-args "youtube:player_client=android" \
+        2>/dev/null`;
 
-// ══════════════════════════════════════════
-//  AUDIO PROXY — télécharge et sert l'audio
-//  avec les bons headers pour iOS
-// ══════════════════════════════════════════
-app.get('/audio', async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
-
-  // Étape 1 — récupérer l'URL directe
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f "140/bestaudio[ext=m4a]/bestaudio[ext=mp4]" --get-url --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
-
-  exec(cmd, { timeout: 45000 }, async (err, stdout) => {
-    if (err || !stdout.trim()) {
-      return res.status(500).json({ error: 'Audio introuvable' });
-    }
-
-    const audioUrl = stdout.trim().split('\n')[0];
-
-    // Étape 2 — proxy avec les bons headers iOS
-    try {
-      const fetch = (await import('node-fetch')).default;
-
-      // Transmettre le Range header si iOS le demande
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)',
-      };
-      if (req.headers.range) {
-        headers['Range'] = req.headers.range;
-      }
-
-      const response = await fetch(audioUrl, { headers });
-
-      // Headers de réponse pour iOS
-      res.setHeader('Content-Type', 'audio/mp4');
-      res.setHeader('Accept-Ranges', 'bytes');
-
-      if (response.headers.get('content-length')) {
-        res.setHeader('Content-Length', response.headers.get('content-length'));
-      }
-      if (response.headers.get('content-range')) {
-        res.setHeader('Content-Range', response.headers.get('content-range'));
-      }
-
-      // Status 206 si Range request, 200 sinon
-      res.status(req.headers.range ? 206 : 200);
-
-      response.body.pipe(res);
-
-      req.on('close', () => {
-        response.body.destroy();
+      exec(cmd2, { timeout: 45000 }, (err2, stdout2) => {
+        if (err2 || !stdout2.trim()) {
+          return res.status(500).json({ error: 'Audio introuvable' });
+        }
+        const [url, dur] = stdout2.trim().split('|||');
+        const duration = parseInt(dur || '0', 10);
+        cache.set(id, { url: url.trim(), duration, time: Date.now() });
+        res.json({ status: 'success', url: url.trim(), duration, id });
       });
-
-    } catch (fetchErr) {
-      console.error('Fetch error:', fetchErr.message);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Erreur proxy audio' });
-      }
+      return;
     }
+
+    const [url, dur] = stdout.trim().split('|||');
+    const duration = parseInt(dur || '0', 10);
+    cache.set(id, { url: url.trim(), duration, time: Date.now() });
+    res.json({ status: 'success', url: url.trim(), duration, id });
   });
 });
 
@@ -137,7 +113,7 @@ app.get('/audio', async (req, res) => {
 // ══════════════════════════════════════════
 function formatDuration(secs) {
   if (!secs) return '0:00';
-  return `${Math.floor(secs / 60)}:${Math.floor(secs % 60).toString().padStart(2, '0')}`;
+  return `${Math.floor(secs/60)}:${Math.floor(secs%60).toString().padStart(2,'0')}`;
 }
 
 app.listen(PORT, () => {
