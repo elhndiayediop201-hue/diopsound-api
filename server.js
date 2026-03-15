@@ -1,6 +1,8 @@
 const express = require('express');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const cors = require('cors');
+const https = require('https');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,7 +24,7 @@ app.get('/search', (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Paramètre q manquant' });
 
-  const cmd = `yt-dlp "ytsearch15:${query}" --dump-json --flat-playlist --no-warnings --no-playlist --extractor-args "youtube:player_client=android" 2>/dev/null`;
+  const cmd = `yt-dlp "ytsearch15:${query}" --dump-json --flat-playlist --no-warnings --no-playlist --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
 
   exec(cmd, { timeout: 45000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
@@ -55,58 +57,69 @@ app.get('/search', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-//  STREAM AUDIO — GET /stream?id=VIDEO_ID
-//  Essaie plusieurs stratégies pour iOS/Android
+//  PROXY AUDIO — GET /audio?id=VIDEO_ID
+//  Railway télécharge et sert l'audio → iOS peut lire directement
+// ══════════════════════════════════════════
+app.get('/audio', (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
+
+  // Utiliser yt-dlp en mode pipe — envoie l'audio directement dans la réponse HTTP
+  res.setHeader('Content-Type', 'audio/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Transfer-Encoding', 'chunked');
+
+  const ytdlp = spawn('yt-dlp', [
+    `https://www.youtube.com/watch?v=${id}`,
+    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/140/bestaudio',
+    '--extractor-args', 'youtube:player_client=android_vr',
+    '-o', '-',          // output vers stdout
+    '--no-warnings',
+    '--quiet',
+  ]);
+
+  ytdlp.stdout.pipe(res);
+
+  ytdlp.stderr.on('data', (data) => {
+    console.error('yt-dlp stderr:', data.toString());
+  });
+
+  ytdlp.on('error', (err) => {
+    console.error('yt-dlp error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erreur yt-dlp' });
+    }
+  });
+
+  ytdlp.on('close', (code) => {
+    if (code !== 0) console.warn(`yt-dlp exited with code ${code}`);
+  });
+
+  req.on('close', () => {
+    ytdlp.kill();
+  });
+});
+
+// ══════════════════════════════════════════
+//  STREAM URL — GET /stream?id=VIDEO_ID
+//  Retourne l'URL directe (fallback)
 // ══════════════════════════════════════════
 app.get('/stream', (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
 
-  // Stratégie 1 — Android client (contourne le blocage datacenter)
-  const cmd1 = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
-    -f "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio" \
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
+    -f "bestaudio[ext=m4a]/bestaudio[ext=mp4]/140/bestaudio" \
     --get-url --no-warnings \
-    --extractor-args "youtube:player_client=android" \
+    --extractor-args "youtube:player_client=android_vr" \
     2>/dev/null`;
 
-  exec(cmd1, { timeout: 45000 }, (err1, stdout1) => {
-    if (!err1 && stdout1.trim()) {
-      const url = stdout1.trim().split('\n')[0];
-      return res.json({ status: 'success', url, id, strategy: 'android' });
+  exec(cmd, { timeout: 45000 }, (err, stdout) => {
+    if (err || !stdout.trim()) {
+      return res.status(500).json({ error: 'Stream introuvable', details: err?.message });
     }
-
-    // Stratégie 2 — Android VR client
-    const cmd2 = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
-      -f "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio" \
-      --get-url --no-warnings \
-      --extractor-args "youtube:player_client=android_vr" \
-      2>/dev/null`;
-
-    exec(cmd2, { timeout: 45000 }, (err2, stdout2) => {
-      if (!err2 && stdout2.trim()) {
-        const url = stdout2.trim().split('\n')[0];
-        return res.json({ status: 'success', url, id, strategy: 'android_vr' });
-      }
-
-      // Stratégie 3 — TV client
-      const cmd3 = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
-        -f "bestaudio" \
-        --get-url --no-warnings \
-        --extractor-args "youtube:player_client=tv" \
-        2>/dev/null`;
-
-      exec(cmd3, { timeout: 45000 }, (err3, stdout3) => {
-        if (!err3 && stdout3.trim()) {
-          const url = stdout3.trim().split('\n')[0];
-          return res.json({ status: 'success', url, id, strategy: 'tv' });
-        }
-
-        return res.status(500).json({
-          error: 'Stream introuvable — YouTube bloque cet accès',
-          id,
-        });
-      });
-    });
+    const audioUrl = stdout.trim().split('\n')[0];
+    res.json({ status: 'success', url: audioUrl, id });
   });
 });
 
@@ -117,7 +130,7 @@ app.get('/info', (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" --dump-json --no-warnings --extractor-args "youtube:player_client=android" 2>/dev/null`;
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" --dump-json --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
 
   exec(cmd, { timeout: 45000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
