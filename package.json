@@ -1,6 +1,6 @@
 {
   "name": "diopsound-api",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "API de streaming musical - Elhadji Ndiaye Diop",
   "main": "server.js",
   "scripts": {
@@ -8,7 +8,8 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "node-fetch": "^3.3.2"
   },
   "engines": {
     "node": ">=18.0.0"
