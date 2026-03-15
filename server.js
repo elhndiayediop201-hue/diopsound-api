@@ -10,25 +10,35 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const cache = new Map();
-const CACHE_TTL = 4 * 60 * 1000;
+const audioCache = new Map();
+const artCache   = new Map();
+const CACHE_TTL  = 4 * 60 * 1000; // 4 min
 
+// ══════════════════════════════════════════
+//  HEALTH
+// ══════════════════════════════════════════
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'DiopSound API 🎵', author: 'Elhadji Ndiaye Diop' });
 });
 
-app.get('/search', (req, res) => {
+// ══════════════════════════════════════════
+//  RECHERCHE + pochettes iTunes
+// ══════════════════════════════════════════
+app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'q manquant' });
+
   const cmd = `yt-dlp "ytsearch15:${query}" --dump-json --flat-playlist --no-warnings --no-playlist --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
-  exec(cmd, { timeout: 45000 }, (err, stdout) => {
+
+  exec(cmd, { timeout: 45000 }, async (err, stdout) => {
     if (err || !stdout.trim()) return res.status(500).json({ error: 'Recherche échouée' });
     try {
       const results = stdout.trim().split('\n').filter(Boolean).map(line => {
         try {
           const item = JSON.parse(line);
           return {
-            id: item.id, title: item.title,
+            id: item.id,
+            title: item.title,
             artist: item.uploader || item.channel || '',
             duration: formatDuration(item.duration || 0),
             durationSec: item.duration || 0,
@@ -37,66 +47,80 @@ app.get('/search', (req, res) => {
           };
         } catch (e) { return null; }
       }).filter(t => t && t.durationSec > 30 && t.durationSec < 7200);
-      res.json({ status: 'success', results });
+
+      // Enrichir avec pochettes iTunes en parallèle
+      const enriched = await Promise.all(results.map(async (track) => {
+        const artwork = await getItunesArtwork(track.title, track.artist);
+        return { ...track, thumbnail: artwork || track.thumbnail };
+      }));
+
+      // Pré-charger les URLs audio en arrière-plan (les 3 premiers)
+      enriched.slice(0, 3).forEach(t => prefetchAudio(t.id));
+
+      res.json({ status: 'success', results: enriched });
     } catch (e) { res.status(500).json({ error: 'Parsing error' }); }
   });
 });
 
 // ══════════════════════════════════════════
-//  AUDIO INFO — retourne URL + durée (pour debug)
+//  POCHETTE iTunes — belle qualité
+// ══════════════════════════════════════════
+app.get('/artwork', async (req, res) => {
+  const { title, artist } = req.query;
+  if (!title) return res.status(400).json({ error: 'title manquant' });
+  const url = await getItunesArtwork(title, artist || '');
+  res.json({ url: url || null });
+});
+
+async function getItunesArtwork(title, artist) {
+  const key = `${title}|${artist}`.toLowerCase();
+  if (artCache.has(key)) return artCache.get(key);
+
+  try {
+    const clean = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
+    const q = encodeURIComponent(`${clean} ${artist}`.trim());
+    const url = `https://itunes.apple.com/search?term=${q}&media=music&limit=3&entity=song`;
+
+    const data = await fetchJson(url);
+    if (data?.results?.length > 0) {
+      // Prendre la meilleure pochette (600x600)
+      const artwork = data.results[0].artworkUrl100
+        ?.replace('100x100', '600x600');
+      if (artwork) {
+        artCache.set(key, artwork);
+        return artwork;
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ══════════════════════════════════════════
+//  AUDIO INFO
 // ══════════════════════════════════════════
 app.get('/audio', (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'id manquant' });
 
-  const cached = cache.get(id);
+  const cached = audioCache.get(id);
   if (cached && Date.now() - cached.time < CACHE_TTL) {
-    return res.json({ status: 'success', url: cached.url, duration: cached.duration, id, cached: true });
+    return res.json({ status: 'success', url: `${req.protocol}://${req.get('host')}/stream/${id}`, duration: cached.duration, id, cached: true });
   }
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f 140 --print "%(url)s|||%(duration)s" --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
-
-  exec(cmd, { timeout: 45000 }, (err, stdout) => {
-    if (!err && stdout.trim()) {
-      const parts = stdout.trim().split('|||');
-      const url = parts[0].trim();
-      const duration = parseInt(parts[1] || '0', 10);
-      if (url.startsWith('http')) {
-        cache.set(id, { url, duration, time: Date.now() });
-        return res.json({ status: 'success', url, duration, id });
-      }
-    }
-    res.status(500).json({ error: 'Audio introuvable' });
+  fetchAudioUrl(id, (err, url, duration) => {
+    if (err || !url) return res.status(500).json({ error: 'Audio introuvable' });
+    res.json({ status: 'success', url: `${req.protocol}://${req.get('host')}/stream/${id}`, duration, id });
   });
 });
 
 // ══════════════════════════════════════════
-//  STREAM — Railway télécharge et streame
-//  vers iOS avec les bons headers
+//  STREAM — proxy audio vers iOS
 // ══════════════════════════════════════════
 app.get('/stream/:id', (req, res) => {
   const id = req.params.id;
-  if (!id) return res.status(400).json({ error: 'id manquant' });
 
-  const getAudioUrl = (callback) => {
-    const cached = cache.get(id);
-    if (cached && Date.now() - cached.time < CACHE_TTL) {
-      return callback(null, cached.url, cached.duration);
-    }
-    const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f 140 --print "%(url)s|||%(duration)s" --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
-    exec(cmd, { timeout: 45000 }, (err, stdout) => {
-      if (err || !stdout.trim()) return callback(err || new Error('yt-dlp failed'));
-      const parts = stdout.trim().split('|||');
-      const url = parts[0].trim();
-      const duration = parseInt(parts[1] || '0', 10);
-      if (!url.startsWith('http')) return callback(new Error('Invalid URL'));
-      cache.set(id, { url, duration, time: Date.now() });
-      callback(null, url, duration);
-    });
-  };
-
-  getAudioUrl((err, audioUrl, duration) => {
-    if (err) return res.status(500).json({ error: 'Audio introuvable' });
+  fetchAudioUrl(id, (err, audioUrl, duration) => {
+    if (err || !audioUrl) return res.status(500).json({ error: 'Audio introuvable' });
 
     const rangeHeader = req.headers.range;
     const urlObj = new URL(audioUrl);
@@ -114,33 +138,69 @@ app.get('/stream/:id', (req, res) => {
     };
 
     const proxyReq = proto.get(options, (proxyRes) => {
-      const status = rangeHeader ? 206 : 200;
       const headers = {
         'Content-Type': 'audio/mp4',
         'Accept-Ranges': 'bytes',
         'Access-Control-Allow-Origin': '*',
         'X-Content-Duration': String(duration),
       };
-
       if (proxyRes.headers['content-length'])
         headers['Content-Length'] = proxyRes.headers['content-length'];
       if (proxyRes.headers['content-range'])
         headers['Content-Range'] = proxyRes.headers['content-range'];
 
-      res.writeHead(proxyRes.statusCode || status, headers);
+      res.writeHead(proxyRes.statusCode || 200, headers);
       proxyRes.pipe(res);
-
       proxyRes.on('error', () => res.end());
     });
 
     proxyReq.on('error', (e) => {
-      console.error('Proxy error:', e.message);
       if (!res.headersSent) res.status(500).json({ error: 'Proxy error' });
     });
 
     req.on('close', () => proxyReq.destroy());
   });
 });
+
+// ══════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════
+function fetchAudioUrl(id, callback) {
+  const cached = audioCache.get(id);
+  if (cached && Date.now() - cached.time < CACHE_TTL) {
+    return callback(null, cached.url, cached.duration);
+  }
+
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f 140 --print "%(url)s|||%(duration)s" --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
+
+  exec(cmd, { timeout: 45000 }, (err, stdout) => {
+    if (err || !stdout.trim()) return callback(err || new Error('failed'));
+    const parts = stdout.trim().split('|||');
+    const url = parts[0].trim();
+    const duration = parseInt(parts[1] || '0', 10);
+    if (!url.startsWith('http')) return callback(new Error('invalid url'));
+    audioCache.set(id, { url, duration, time: Date.now() });
+    callback(null, url, duration);
+  });
+}
+
+// Pré-charger l'URL audio en arrière-plan
+function prefetchAudio(id) {
+  if (audioCache.has(id)) return;
+  fetchAudioUrl(id, () => {});
+}
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'DiopSound/1.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
 
 function formatDuration(secs) {
   if (!secs) return '0:00';
