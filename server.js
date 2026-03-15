@@ -1,8 +1,6 @@
 const express = require('express');
 const { exec, spawn } = require('child_process');
 const cors = require('cors');
-const https = require('https');
-const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,7 +16,7 @@ app.get('/health', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-//  RECHERCHE — GET /search?q=Drake
+//  RECHERCHE
 // ══════════════════════════════════════════
 app.get('/search', (req, res) => {
   const query = req.query.q;
@@ -28,11 +26,11 @@ app.get('/search', (req, res) => {
 
   exec(cmd, { timeout: 45000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
-      return res.status(500).json({ error: 'Recherche échouée', details: err?.message });
+      return res.status(500).json({ error: 'Recherche échouée' });
     }
     try {
-      const lines = stdout.trim().split('\n').filter(Boolean);
-      const results = lines
+      const results = stdout.trim().split('\n')
+        .filter(Boolean)
         .map(line => {
           try {
             const item = JSON.parse(line);
@@ -47,108 +45,89 @@ app.get('/search', (req, res) => {
             };
           } catch (e) { return null; }
         })
-        .filter(Boolean)
-        .filter(t => t.durationSec > 30 && t.durationSec < 7200);
+        .filter(t => t && t.durationSec > 30 && t.durationSec < 7200);
       res.json({ status: 'success', results });
     } catch (e) {
-      res.status(500).json({ error: 'Erreur parsing', details: e.message });
+      res.status(500).json({ error: 'Erreur parsing' });
     }
   });
 });
 
 // ══════════════════════════════════════════
-//  PROXY AUDIO — GET /audio?id=VIDEO_ID
-//  Railway télécharge et sert l'audio → iOS peut lire directement
-// ══════════════════════════════════════════
-app.get('/audio', (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
-
-  // Utiliser yt-dlp en mode pipe — envoie l'audio directement dans la réponse HTTP
-  res.setHeader('Content-Type', 'audio/mp4');
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Transfer-Encoding', 'chunked');
-
-  const ytdlp = spawn('yt-dlp', [
-    `https://www.youtube.com/watch?v=${id}`,
-    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/140/bestaudio',
-    '--extractor-args', 'youtube:player_client=android_vr',
-    '-o', '-',          // output vers stdout
-    '--no-warnings',
-    '--quiet',
-  ]);
-
-  ytdlp.stdout.pipe(res);
-
-  ytdlp.stderr.on('data', (data) => {
-    console.error('yt-dlp stderr:', data.toString());
-  });
-
-  ytdlp.on('error', (err) => {
-    console.error('yt-dlp error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Erreur yt-dlp' });
-    }
-  });
-
-  ytdlp.on('close', (code) => {
-    if (code !== 0) console.warn(`yt-dlp exited with code ${code}`);
-  });
-
-  req.on('close', () => {
-    ytdlp.kill();
-  });
-});
-
-// ══════════════════════════════════════════
-//  STREAM URL — GET /stream?id=VIDEO_ID
-//  Retourne l'URL directe (fallback)
+//  STREAM URL — retourne l'URL directe
 // ══════════════════════════════════════════
 app.get('/stream', (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
-    -f "bestaudio[ext=m4a]/bestaudio[ext=mp4]/140/bestaudio" \
-    --get-url --no-warnings \
-    --extractor-args "youtube:player_client=android_vr" \
-    2>/dev/null`;
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f "140/bestaudio[ext=m4a]/bestaudio[ext=mp4]" --get-url --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
 
   exec(cmd, { timeout: 45000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
-      return res.status(500).json({ error: 'Stream introuvable', details: err?.message });
+      return res.status(500).json({ error: 'Stream introuvable' });
     }
-    const audioUrl = stdout.trim().split('\n')[0];
-    res.json({ status: 'success', url: audioUrl, id });
+    const url = stdout.trim().split('\n')[0];
+    res.json({ status: 'success', url, id });
   });
 });
 
 // ══════════════════════════════════════════
-//  INFOS TITRE — GET /info?id=VIDEO_ID
+//  AUDIO PROXY — télécharge et sert l'audio
+//  avec les bons headers pour iOS
 // ══════════════════════════════════════════
-app.get('/info', (req, res) => {
+app.get('/audio', async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" --dump-json --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
+  // Étape 1 — récupérer l'URL directe
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f "140/bestaudio[ext=m4a]/bestaudio[ext=mp4]" --get-url --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
 
-  exec(cmd, { timeout: 45000 }, (err, stdout) => {
+  exec(cmd, { timeout: 45000 }, async (err, stdout) => {
     if (err || !stdout.trim()) {
-      return res.status(500).json({ error: 'Info introuvable' });
+      return res.status(500).json({ error: 'Audio introuvable' });
     }
+
+    const audioUrl = stdout.trim().split('\n')[0];
+
+    // Étape 2 — proxy avec les bons headers iOS
     try {
-      const data = JSON.parse(stdout.trim());
-      res.json({
-        status:      'success',
-        id:          data.id,
-        title:       data.title,
-        artist:      data.uploader || data.channel,
-        duration:    formatDuration(data.duration || 0),
-        durationSec: data.duration || 0,
-        thumbnail:   data.thumbnail,
+      const fetch = (await import('node-fetch')).default;
+
+      // Transmettre le Range header si iOS le demande
+      const headers = {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)',
+      };
+      if (req.headers.range) {
+        headers['Range'] = req.headers.range;
+      }
+
+      const response = await fetch(audioUrl, { headers });
+
+      // Headers de réponse pour iOS
+      res.setHeader('Content-Type', 'audio/mp4');
+      res.setHeader('Accept-Ranges', 'bytes');
+
+      if (response.headers.get('content-length')) {
+        res.setHeader('Content-Length', response.headers.get('content-length'));
+      }
+      if (response.headers.get('content-range')) {
+        res.setHeader('Content-Range', response.headers.get('content-range'));
+      }
+
+      // Status 206 si Range request, 200 sinon
+      res.status(req.headers.range ? 206 : 200);
+
+      response.body.pipe(res);
+
+      req.on('close', () => {
+        response.body.destroy();
       });
-    } catch (e) {
-      res.status(500).json({ error: 'Erreur parsing' });
+
+    } catch (fetchErr) {
+      console.error('Fetch error:', fetchErr.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Erreur proxy audio' });
+      }
     }
   });
 });
@@ -158,12 +137,9 @@ app.get('/info', (req, res) => {
 // ══════════════════════════════════════════
 function formatDuration(secs) {
   if (!secs) return '0:00';
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  return `${Math.floor(secs / 60)}:${Math.floor(secs % 60).toString().padStart(2, '0')}`;
 }
 
 app.listen(PORT, () => {
-  console.log(`🎵 DiopSound API démarrée sur le port ${PORT}`);
-  console.log(`   Créée par Elhadji Ndiaye Diop`);
+  console.log(`🎵 DiopSound API - Elhadji Ndiaye Diop - Port ${PORT}`);
 });
