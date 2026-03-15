@@ -12,17 +12,22 @@ app.use(express.json());
 
 const audioCache = new Map();
 const artCache   = new Map();
-const CACHE_TTL  = 4 * 60 * 1000; // 4 min
+const CACHE_TTL  = 5 * 60 * 1000; // 5 minutes
 
 // ══════════════════════════════════════════
 //  HEALTH
 // ══════════════════════════════════════════
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'DiopSound API 🎵', author: 'Elhadji Ndiaye Diop' });
+  res.json({
+    status: 'ok',
+    message: 'DiopSound API 🎵',
+    author: 'Elhadji Ndiaye Diop',
+    cached: audioCache.size,
+  });
 });
 
 // ══════════════════════════════════════════
-//  RECHERCHE + pochettes iTunes
+//  RECHERCHE + pochettes iTunes + pré-cache
 // ══════════════════════════════════════════
 app.get('/search', async (req, res) => {
   const query = req.query.q;
@@ -32,13 +37,13 @@ app.get('/search', async (req, res) => {
 
   exec(cmd, { timeout: 45000 }, async (err, stdout) => {
     if (err || !stdout.trim()) return res.status(500).json({ error: 'Recherche échouée' });
+
     try {
       const results = stdout.trim().split('\n').filter(Boolean).map(line => {
         try {
           const item = JSON.parse(line);
           return {
-            id: item.id,
-            title: item.title,
+            id: item.id, title: item.title,
             artist: item.uploader || item.channel || '',
             duration: formatDuration(item.duration || 0),
             durationSec: item.duration || 0,
@@ -48,52 +53,34 @@ app.get('/search', async (req, res) => {
         } catch (e) { return null; }
       }).filter(t => t && t.durationSec > 30 && t.durationSec < 7200);
 
-      // Enrichir avec pochettes iTunes en parallèle
-      const enriched = await Promise.all(results.map(async (track) => {
-        const artwork = await getItunesArtwork(track.title, track.artist);
-        return { ...track, thumbnail: artwork || track.thumbnail };
-      }));
-
-      // Pré-charger les URLs audio en arrière-plan (les 3 premiers)
-      enriched.slice(0, 3).forEach(t => prefetchAudio(t.id));
+      // Enrichir pochettes iTunes + pré-cacher audio EN PARALLÈLE
+      const [enriched] = await Promise.all([
+        Promise.all(results.map(async track => {
+          const artwork = await getItunesArtwork(track.title, track.artist);
+          return { ...track, thumbnail: artwork || track.thumbnail };
+        })),
+        // Pré-cacher les 5 premiers titres en arrière-plan
+        ...results.slice(0, 5).map(t => precacheAudio(t.id)),
+      ]);
 
       res.json({ status: 'success', results: enriched });
-    } catch (e) { res.status(500).json({ error: 'Parsing error' }); }
+    } catch (e) {
+      res.status(500).json({ error: 'Parsing error' });
+    }
   });
 });
 
 // ══════════════════════════════════════════
-//  POCHETTE iTunes — belle qualité
+//  PRÉ-CACHE — appelé par l'app en avance
 // ══════════════════════════════════════════
-app.get('/artwork', async (req, res) => {
-  const { title, artist } = req.query;
-  if (!title) return res.status(400).json({ error: 'title manquant' });
-  const url = await getItunesArtwork(title, artist || '');
-  res.json({ url: url || null });
+app.post('/precache', (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids manquant' });
+
+  // Pré-cacher tous les IDs en arrière-plan
+  ids.forEach(id => precacheAudio(id));
+  res.json({ status: 'ok', queued: ids.length });
 });
-
-async function getItunesArtwork(title, artist) {
-  const key = `${title}|${artist}`.toLowerCase();
-  if (artCache.has(key)) return artCache.get(key);
-
-  try {
-    const clean = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
-    const q = encodeURIComponent(`${clean} ${artist}`.trim());
-    const url = `https://itunes.apple.com/search?term=${q}&media=music&limit=3&entity=song`;
-
-    const data = await fetchJson(url);
-    if (data?.results?.length > 0) {
-      // Prendre la meilleure pochette (600x600)
-      const artwork = data.results[0].artworkUrl100
-        ?.replace('100x100', '600x600');
-      if (artwork) {
-        artCache.set(key, artwork);
-        return artwork;
-      }
-    }
-  } catch (e) {}
-  return null;
-}
 
 // ══════════════════════════════════════════
 //  AUDIO INFO
@@ -104,12 +91,12 @@ app.get('/audio', (req, res) => {
 
   const cached = audioCache.get(id);
   if (cached && Date.now() - cached.time < CACHE_TTL) {
-    return res.json({ status: 'success', url: `${req.protocol}://${req.get('host')}/stream/${id}`, duration: cached.duration, id, cached: true });
+    return res.json({ status: 'success', duration: cached.duration, id, cached: true });
   }
 
   fetchAudioUrl(id, (err, url, duration) => {
     if (err || !url) return res.status(500).json({ error: 'Audio introuvable' });
-    res.json({ status: 'success', url: `${req.protocol}://${req.get('host')}/stream/${id}`, duration, id });
+    res.json({ status: 'success', duration, id });
   });
 });
 
@@ -154,7 +141,7 @@ app.get('/stream/:id', (req, res) => {
       proxyRes.on('error', () => res.end());
     });
 
-    proxyReq.on('error', (e) => {
+    proxyReq.on('error', e => {
       if (!res.headersSent) res.status(500).json({ error: 'Proxy error' });
     });
 
@@ -165,39 +152,64 @@ app.get('/stream/:id', (req, res) => {
 // ══════════════════════════════════════════
 //  HELPERS
 // ══════════════════════════════════════════
+
+// Récupère l'URL audio depuis yt-dlp (avec cache)
 function fetchAudioUrl(id, callback) {
   const cached = audioCache.get(id);
   if (cached && Date.now() - cached.time < CACHE_TTL) {
     return callback(null, cached.url, cached.duration);
   }
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f 140 --print "%(url)s|||%(duration)s" --no-warnings --extractor-args "youtube:player_client=android_vr" 2>/dev/null`;
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" \
+    -f 140 \
+    --print "%(url)s|||%(duration)s" \
+    --no-warnings \
+    --extractor-args "youtube:player_client=android_vr" \
+    2>/dev/null`;
 
   exec(cmd, { timeout: 45000 }, (err, stdout) => {
-    if (err || !stdout.trim()) return callback(err || new Error('failed'));
-    const parts = stdout.trim().split('|||');
-    const url = parts[0].trim();
-    const duration = parseInt(parts[1] || '0', 10);
-    if (!url.startsWith('http')) return callback(new Error('invalid url'));
-    audioCache.set(id, { url, duration, time: Date.now() });
-    callback(null, url, duration);
+    if (!err && stdout.trim()) {
+      const parts = stdout.trim().split('|||');
+      const url = parts[0].trim();
+      const duration = parseInt(parts[1] || '0', 10);
+      if (url.startsWith('http')) {
+        audioCache.set(id, { url, duration, time: Date.now() });
+        return callback(null, url, duration);
+      }
+    }
+    callback(err || new Error('yt-dlp failed'));
   });
 }
 
-// Pré-charger l'URL audio en arrière-plan
-function prefetchAudio(id) {
-  if (audioCache.has(id)) return;
+// Pré-cache silencieux en arrière-plan
+function precacheAudio(id) {
+  if (!id) return;
+  const cached = audioCache.get(id);
+  if (cached && Date.now() - cached.time < CACHE_TTL) return;
+  // Lancer sans callback — résultat stocké en cache pour plus tard
   fetchAudioUrl(id, () => {});
+}
+
+// Pochettes iTunes
+async function getItunesArtwork(title, artist) {
+  const key = `${title}|${artist}`.toLowerCase().slice(0, 50);
+  if (artCache.has(key)) return artCache.get(key);
+  try {
+    const clean = title.replace(/\(.*?\)/g,'').replace(/\[.*?\]/g,'').trim();
+    const q = encodeURIComponent(`${clean} ${artist}`.trim());
+    const data = await fetchJson(`https://itunes.apple.com/search?term=${q}&media=music&limit=3&entity=song`);
+    const art = data?.results?.[0]?.artworkUrl100?.replace('100x100','600x600');
+    artCache.set(key, art || null);
+    return art || null;
+  } catch (e) { return null; }
 }
 
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'DiopSound/1.0' } }, (res) => {
+    https.get(url, { headers: { 'User-Agent': 'DiopSound/1.0' } }, res => {
       let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-      });
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
     }).on('error', reject);
   });
 }
@@ -206,6 +218,14 @@ function formatDuration(secs) {
   if (!secs) return '0:00';
   return `${Math.floor(secs/60)}:${Math.floor(secs%60).toString().padStart(2,'0')}`;
 }
+
+// Nettoyer le cache expired toutes les 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of audioCache.entries()) {
+    if (now - v.time > CACHE_TTL) audioCache.delete(k);
+  }
+}, 10 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`🎵 DiopSound API - Elhadji Ndiaye Diop - Port ${PORT}`);
