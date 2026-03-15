@@ -57,7 +57,8 @@ app.get('/stream', (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: 'Paramètre id manquant' });
 
-  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f bestaudio --get-url --no-warnings 2>/dev/null`;
+  // Forcer M4A/AAC — compatible iOS et Android
+  const cmd = `yt-dlp "https://www.youtube.com/watch?v=${id}" -f "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio" --get-url --no-warnings 2>/dev/null`;
 
   exec(cmd, { timeout: 30000 }, (err, stdout) => {
     if (err || !stdout.trim()) {
