@@ -14,9 +14,9 @@ app.use(express.json());
 //      les Variables d'environnement,
 //      PAS en dur dans le code !
 // ══════════════════════════════════════════
-const SPOTIFY_CLIENT_ID     = process.env.SPOTIFY_CLIENT_ID     || 'c6951b0d0594417a980008a2f0d68d05';
-const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || 'c374844068ef48008ad07cda531e7090';
-const SPOTIFY_REDIRECT_URI  = process.env.SPOTIFY_REDIRECT_URI  || 'https://auth.expo.io/@elhadji2002/diopsound';
+const SPOTIFY_CLIENT_ID     = process.env.SPOTIFY_CLIENT_ID    ;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET 
+const SPOTIFY_REDIRECT_URI  = process.env.SPOTIFY_REDIRECT_URI  
 
 // Cache token client credentials (pour search/chart)
 let ccToken     = null;
