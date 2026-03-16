@@ -60,6 +60,28 @@ app.get('/health', (req, res) => {
 
 
 // DEBUG
+
+// DEBUG SEARCH
+app.get('/debug-search', async (req, res) => {
+  try {
+    const token = await getClientToken();
+    const url   = 'https://api.spotify.com/v1/search?q=drake&type=track&limit=5&market=FR';
+    const data  = await fetchJson(url, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    res.json({
+      token_ok:     !!token,
+      total:        data.tracks?.total,
+      items_count:  data.tracks?.items?.length,
+      first_track:  data.tracks?.items?.[0]?.name,
+      error:        data.error || null,
+      raw_keys:     Object.keys(data),
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
 app.get('/debug-token', async (req, res) => {
   try {
     const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
