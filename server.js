@@ -1,7 +1,6 @@
 const express = require('express');
-const { exec }  = require('child_process');
-const cors      = require('cors');
-const axios     = require('axios');
+const cors    = require('cors');
+const https   = require('https');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -9,210 +8,348 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ══════════════════════════════════════════════════════════════════
-//  CACHE EN MÉMOIRE — évite de re-lancer yt-dlp pour le même ID
-// ══════════════════════════════════════════════════════════════════
-const streamCache   = new Map(); // ytId   → { url, time }
-const resolveCache  = new Map(); // query  → { youtubeId, time }
-const durationCache = new Map(); // ytId   → { duration, time }
-const CACHE_TTL     = 5 * 60 * 1000; // 5 minutes
+// ══════════════════════════════════════════
+//  CONFIG SPOTIFY
+//  ⚠️  Sur Railway : mets ces valeurs dans
+//      les Variables d'environnement,
+//      PAS en dur dans le code !
+// ══════════════════════════════════════════
+const SPOTIFY_CLIENT_ID     = process.env.SPOTIFY_CLIENT_ID     || 'c6951b0d0594417a980008a2f0d68d05';
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || 'c374844068ef48008ad07cda531e7090';
+const SPOTIFY_REDIRECT_URI  = process.env.SPOTIFY_REDIRECT_URI  || 'https://auth.expo.io/@elhadji2002/diopsound';
 
-function cacheSet(map, key, value) {
-  map.set(key, { value, time: Date.now() });
-}
-function cacheGet(map, key) {
-  const entry = map.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.time > CACHE_TTL) { map.delete(key); return null; }
-  return entry.value;
-}
+// Cache token client credentials (pour search/chart)
+let ccToken     = null;
+let ccExpiresAt = 0;
 
-// ══════════════════════════════════════════════════════════════════
-//  HELPERS
-// ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════
+//  TOKEN CLIENT CREDENTIALS
+//  (pas besoin d'un utilisateur connecté,
+//   pour search et metadata uniquement)
+// ══════════════════════════════════════════
+async function getClientToken() {
+  if (ccToken && Date.now() < ccExpiresAt - 10000) return ccToken;
 
-// Exécute une commande shell avec timeout
-function execPromise(cmd, timeoutMs = 15000) {
-  return new Promise((resolve, reject) => {
-    const proc = exec(cmd, { timeout: timeoutMs }, (err, stdout, stderr) => {
-      if (err) reject(err);
-      else     resolve(stdout.trim());
-    });
+  const creds  = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+  const body   = 'grant_type=client_credentials';
+
+  const data = await fetchJson('https://accounts.spotify.com/api/token', {
+    method:  'POST',
+    headers: {
+      'Authorization': `Basic ${creds}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
+    body,
   });
+
+  ccToken     = data.access_token;
+  ccExpiresAt = Date.now() + data.expires_in * 1000;
+  return ccToken;
 }
 
-// Récupère l'URL de stream d'un video YouTube via yt-dlp
-async function getStreamUrl(ytId) {
-  const cached = cacheGet(streamCache, ytId);
-  if (cached) return cached;
+// ══════════════════════════════════════════
+//  AUTH UTILISATEUR — Étape 1 : Login
+//  L'app mobile redirige l'utilisateur ici
+// ══════════════════════════════════════════
+app.get('/auth/login', (req, res) => {
+  const scopes = [
+    'streaming',
+    'user-read-email',
+    'user-read-private',
+    'user-read-playback-state',
+    'user-modify-playback-state',
+    'user-read-currently-playing',
+    'user-library-read',
+    'user-library-modify',
+    'playlist-read-private',
+    'user-top-read',
+    'user-read-recently-played',
+  ].join(' ');
 
-  const url = await execPromise(
-    `yt-dlp "https://www.youtube.com/watch?v=${ytId}" -f 140 --get-url --no-playlist`
-  );
-  if (!url) throw new Error('yt-dlp returned empty URL');
+  const params = new URLSearchParams({
+    client_id:     SPOTIFY_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri:  SPOTIFY_REDIRECT_URI,
+    scope:         scopes,
+    show_dialog:   'false',
+  });
 
-  cacheSet(streamCache, ytId, url);
-  return url;
-}
-
-// ══════════════════════════════════════════════════════════════════
-//  ROUTE : RESOLVE — trouve le YouTube ID d'un titre
-//  GET /resolve?q=Drake+God%27s+Plan
-// ══════════════════════════════════════════════════════════════════
-app.get('/resolve', async (req, res) => {
-  const query = req.query.q;
-  if (!query) return res.status(400).json({ error: 'Missing query' });
-
-  // Cache
-  const cached = cacheGet(resolveCache, query);
-  if (cached) return res.json({ youtubeId: cached });
-
-  try {
-    // Utilise yt-dlp pour chercher directement sur YouTube Music
-    // (plus fiable que l'API YouTube pour trouver la bonne version)
-    const ytId = await execPromise(
-      `yt-dlp "ytsearch1:${query.replace(/"/g, '')}" --get-id --no-playlist`,
-      10000
-    );
-
-    if (!ytId || ytId.length !== 11) {
-      return res.json({ youtubeId: null });
-    }
-
-    cacheSet(resolveCache, query, ytId);
-    res.json({ youtubeId: ytId });
-
-  } catch (e) {
-    console.error('[resolve] error:', e.message);
-    res.json({ youtubeId: null });
-  }
+  res.redirect(`https://accounts.spotify.com/authorize?${params}`);
 });
 
-// ══════════════════════════════════════════════════════════════════
-//  ROUTE : DURATION — durée réelle d'un track YouTube
-//  GET /duration/:ytId
-// ══════════════════════════════════════════════════════════════════
-app.get('/duration/:id', async (req, res) => {
-  const ytId = req.params.id;
-
-  const cached = cacheGet(durationCache, ytId);
-  if (cached) return res.json({ duration: cached });
+// ══════════════════════════════════════════
+//  AUTH UTILISATEUR — Étape 2 : Callback
+//  Spotify redirige ici avec le code
+// ══════════════════════════════════════════
+app.post('/auth/token', async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'code manquant' });
 
   try {
-    const raw = await execPromise(
-      `yt-dlp "https://www.youtube.com/watch?v=${ytId}" --get-duration --no-playlist`,
-      10000
-    );
-
-    // Format "3:45" ou "1:02:30" → secondes
-    const parts    = raw.split(':').map(Number);
-    let   duration = 0;
-    if (parts.length === 2) duration = parts[0] * 60 + parts[1];
-    if (parts.length === 3) duration = parts[0] * 3600 + parts[1] * 60 + parts[2];
-
-    cacheSet(durationCache, ytId, duration);
-    res.json({ duration });
-
-  } catch (e) {
-    res.json({ duration: 0 });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════
-//  ROUTE : STREAM — proxy audio vers l'app mobile
-//  GET /stream/:ytId
-// ══════════════════════════════════════════════════════════════════
-app.get('/stream/:id', async (req, res) => {
-  const ytId = req.params.id;
-
-  try {
-    const streamUrl = await getStreamUrl(ytId);
-
-    // Supporte le Range header pour la seekbar mobile
-    const rangeHeader = req.headers.range;
-
-    const axiosConfig = {
-      method:       'get',
-      url:          streamUrl,
-      responseType: 'stream',
-      headers:      {
-        'User-Agent': 'Mozilla/5.0 (compatible; DiopSound/1.0)',
-        ...(rangeHeader ? { Range: rangeHeader } : {}),
+    const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+    const data  = await fetchJson('https://accounts.spotify.com/api/token', {
+      method:  'POST',
+      headers: {
+        'Authorization': `Basic ${creds}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
       },
-      timeout: 30000,
-    };
+      body: new URLSearchParams({
+        grant_type:   'authorization_code',
+        code,
+        redirect_uri: SPOTIFY_REDIRECT_URI,
+      }).toString(),
+    });
 
-    const response = await axios(axiosConfig);
-
-    // Transfère les headers importants
-    res.setHeader('Content-Type',  response.headers['content-type']  || 'audio/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    if (response.headers['content-length'])
-      res.setHeader('Content-Length', response.headers['content-length']);
-    if (response.headers['content-range'])
-      res.setHeader('Content-Range', response.headers['content-range']);
-
-    res.status(rangeHeader ? 206 : 200);
-    response.data.pipe(res);
-
-    // Nettoyage si le client coupe la connexion
-    req.on('close', () => response.data.destroy());
-
+    res.json({
+      access_token:  data.access_token,
+      refresh_token: data.refresh_token,
+      expires_in:    data.expires_in,
+    });
   } catch (e) {
-    console.error('[stream] error:', e.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Stream unavailable' });
-    }
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ══════════════════════════════════════════════════════════════════
-//  ROUTE : SEARCH — recherche YouTube (optionnel, pour usage futur)
-//  GET /search?q=Drake
-// ══════════════════════════════════════════════════════════════════
-app.get('/search', async (req, res) => {
-  const query  = req.query.q;
-  const YT_KEY = process.env.YT_API_KEY;
-
-  if (!YT_KEY) return res.status(500).json({ error: 'YT_API_KEY not configured' });
+// ══════════════════════════════════════════
+//  AUTH — Refresh token
+// ══════════════════════════════════════════
+app.post('/auth/refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+  if (!refresh_token) return res.status(400).json({ error: 'refresh_token manquant' });
 
   try {
-    const url    = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(query)}&type=video&videoCategoryId=10&maxResults=15&key=${YT_KEY}`;
-    const { data } = await axios.get(url);
+    const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+    const data  = await fetchJson('https://accounts.spotify.com/api/token', {
+      method:  'POST',
+      headers: {
+        'Authorization': `Basic ${creds}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type:    'refresh_token',
+        refresh_token,
+      }).toString(),
+    });
 
-    const results = (data.items || []).map(item => ({
-      youtubeId: item.id.videoId,
-      title:     item.snippet.title.replace(/\(Official.*?\)/gi, '').trim(),
-      artist:    item.snippet.channelTitle.replace(' - Topic', '').trim(),
-      thumbnail: item.snippet.thumbnails.high?.url || '',
-    }));
-
-    res.json({ status: 'success', results });
+    res.json({
+      access_token: data.access_token,
+      expires_in:   data.expires_in,
+    });
   } catch (e) {
-    res.status(500).json({ error: 'Search failed', detail: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ══════════════════════════════════════════════════════════════════
-//  ROUTE : HEALTH CHECK
-// ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════
+//  HEALTH
+// ══════════════════════════════════════════
 app.get('/health', (req, res) => {
   res.json({
-    status:    'ok',
-    service:   'DiopSound API',
-    timestamp: new Date().toISOString(),
-    cache: {
-      streams:  streamCache.size,
-      resolves: resolveCache.size,
-      durations: durationCache.size,
-    },
+    status: 'ok',
+    author: 'Elhadji Ndiaye Diop',
+    source: 'Spotify API',
+    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
   });
 });
 
-app.get('/', (req, res) => {
-  res.json({ message: '🎵 DiopSound API is running', version: '2.0.0' });
+// ══════════════════════════════════════════
+//  CHART — Top 50 mondial Spotify
+// ══════════════════════════════════════════
+app.get('/chart', async (req, res) => {
+  try {
+    const token = await getClientToken();
+    // Playlist "Top 50 - Global" officielle Spotify
+    const data  = await spotifyGet('playlists/37i9dQZEVXbMDoHDwVN2tF/tracks?limit=50&market=FR', token);
+    const tracks = (data.items || [])
+      .filter(i => i.track && i.track.type === 'track')
+      .map(i => normalizeSpotify(i.track));
+    res.json({ status: 'success', results: tracks });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`🎵 DiopSound API v2.0 — port ${PORT}`);
+// ══════════════════════════════════════════
+//  SEARCH
+// ══════════════════════════════════════════
+app.get('/search', async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: 'q manquant' });
+
+  try {
+    const token = await getClientToken();
+    const data  = await spotifyGet(
+      `search?q=${encodeURIComponent(q)}&type=track&limit=25&market=FR`,
+      token
+    );
+    const tracks = (data.tracks?.items || []).map(normalizeSpotify);
+    res.json({ status: 'success', results: tracks });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
+
+// ══════════════════════════════════════════
+//  ARTISTE
+// ══════════════════════════════════════════
+app.get('/artist/:id', async (req, res) => {
+  try {
+    const token = await getClientToken();
+    const [artist, topTracks, albums] = await Promise.all([
+      spotifyGet(`artists/${req.params.id}`, token),
+      spotifyGet(`artists/${req.params.id}/top-tracks?market=FR`, token),
+      spotifyGet(`artists/${req.params.id}/albums?limit=6&include_groups=album,single&market=FR`, token),
+    ]);
+
+    res.json({
+      status: 'success',
+      artist: {
+        id:      artist.id,
+        name:    artist.name,
+        picture: artist.images?.[0]?.url || '',
+        fans:    artist.followers?.total || 0,
+        genres:  artist.genres || [],
+      },
+      topTracks: (topTracks.tracks || []).map(normalizeSpotify),
+      albums: (albums.items || []).map(a => ({
+        id:    a.id,
+        title: a.name,
+        cover: a.images?.[0]?.url || '',
+        year:  a.release_date?.slice(0, 4),
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════
+//  ALBUM
+// ══════════════════════════════════════════
+app.get('/album/:id', async (req, res) => {
+  try {
+    const token = await getClientToken();
+    const data  = await spotifyGet(`albums/${req.params.id}?market=FR`, token);
+
+    res.json({
+      status: 'success',
+      album: {
+        id:     data.id,
+        title:  data.name,
+        cover:  data.images?.[0]?.url || '',
+        artist: data.artists?.[0]?.name || '',
+        year:   data.release_date?.slice(0, 4),
+        tracks: (data.tracks?.items || []).map(t => normalizeSpotify({ ...t, album: data })),
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════
+//  GENRE — recherche par genre
+// ══════════════════════════════════════════
+app.get('/genre/:name', async (req, res) => {
+  try {
+    const token = await getClientToken();
+    const data  = await spotifyGet(
+      `search?q=genre:${encodeURIComponent(req.params.name)}&type=track&limit=20&market=FR`,
+      token
+    );
+    const tracks = (data.tracks?.items || []).map(normalizeSpotify);
+    res.json({ status: 'success', results: tracks });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════
+//  RECOMMENDATIONS — basé sur une piste
+// ══════════════════════════════════════════
+app.get('/recommendations', async (req, res) => {
+  const { seed_tracks, seed_artists } = req.query;
+  if (!seed_tracks && !seed_artists) return res.status(400).json({ error: 'seed manquant' });
+
+  try {
+    const token  = await getClientToken();
+    const params = new URLSearchParams({ limit: '20', market: 'FR' });
+    if (seed_tracks)  params.set('seed_tracks',  seed_tracks);
+    if (seed_artists) params.set('seed_artists', seed_artists);
+
+    const data   = await spotifyGet(`recommendations?${params}`, token);
+    const tracks = (data.tracks || []).map(normalizeSpotify);
+    res.json({ status: 'success', results: tracks });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════
+async function spotifyGet(path, token) {
+  return fetchJson(`https://api.spotify.com/v1/${path}`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+}
+
+function normalizeSpotify(item) {
+  return {
+    id:          item.id,
+    spotifyId:   item.id,
+    title:       item.name || '',
+    artist:      item.artists?.[0]?.name || '',
+    artistId:    item.artists?.[0]?.id   || '',
+    album:       item.album?.name        || '',
+    albumId:     item.album?.id          || '',
+    duration:    formatDuration(Math.floor((item.duration_ms || 0) / 1000)),
+    durationSec: Math.floor((item.duration_ms || 0) / 1000),
+    thumbnail:   item.album?.images?.[0]?.url || '',
+    previewUrl:  item.preview_url || null,  // preview 30s Spotify (peut être null)
+    explicit:    item.explicit || false,
+    popularity:  item.popularity || 0,
+    uri:         item.uri || `spotify:track:${item.id}`,
+  };
+}
+
+function formatDuration(s) {
+  if (!s) return '0:00';
+  return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+}
+
+function fetchJson(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const urlObj  = new URL(url);
+    const isHttps = urlObj.protocol === 'https:';
+    const lib     = isHttps ? https : require('http');
+
+    const reqOptions = {
+      hostname: urlObj.hostname,
+      path:     urlObj.pathname + urlObj.search,
+      method:   options.method || 'GET',
+      headers:  {
+        'User-Agent':   'DiopSound/2.0',
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+    };
+
+    const req = lib.request(reqOptions, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+        catch (e) { reject(e); }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+app.listen(PORT, () => console.log(`🎵 DiopSound API v2 (Spotify) — Elhadji Ndiaye Diop — Port ${PORT}`));
