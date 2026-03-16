@@ -65,7 +65,7 @@ app.get('/health', (req, res) => {
 app.get('/debug-search', async (req, res) => {
   try {
     const token = await getClientToken();
-    const url   = 'https://api.spotify.com/v1/search?q=drake&type=track&limit=5&market=FR';
+    const url   = 'https://api.spotify.com/v1/search?' + new URLSearchParams({ q: 'drake', type: 'track', limit: '5', market: 'FR' }).toString();
     const data  = await fetchJson(url, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
@@ -159,10 +159,9 @@ app.post('/auth/refresh', async (req, res) => {
 app.get('/chart', async (req, res) => {
   try {
     const token  = await getClientToken();
-    const data   = await spotifyGet('playlists/37i9dQZEVXbMDoHDwVN2tF/tracks?limit=50&market=FR', token);
-    const tracks = (data.items || [])
-      .filter(i => i.track && i.track.type === 'track')
-      .map(i => normalizeSpotify(i.track));
+    // Recherche "top hits 2025" — accessible sans restriction
+    const data   = await spotifyGet('search?q=top+hits+2025&type=track&limit=50&market=FR', token);
+    const tracks = (data.tracks?.items || []).map(normalizeSpotify);
     res.json({ status: 'success', results: tracks });
   } catch (e) {
     console.error('/chart error:', e.message);
@@ -180,7 +179,8 @@ app.get('/search', async (req, res) => {
     // Forcer un nouveau token à chaque fois (évite le cache périmé)
     ccToken = null;
     const token  = await getClientToken();
-    const data   = await spotifyGet(`search?q=${encodeURIComponent(q)}&type=track&limit=25&market=FR`, token);
+    const params = new URLSearchParams({ q, type: 'track', limit: '20', market: 'FR' });
+    const data   = await spotifyGet('search?' + params.toString(), token);
     console.log(`/search "${q}" → total:${data.tracks?.total} items:${data.tracks?.items?.length} error:${data.error?.status}`);
     const tracks = (data.tracks?.items || []).map(normalizeSpotify);
     res.json({ status: 'success', results: tracks });
@@ -234,7 +234,8 @@ app.get('/album/:id', async (req, res) => {
 app.get('/genre/:name', async (req, res) => {
   try {
     const token  = await getClientToken();
-    const data   = await spotifyGet(`search?q=${encodeURIComponent(req.params.name)}&type=track&limit=20&market=FR`, token);
+    const params = new URLSearchParams({ q: req.params.name, type: 'track', limit: '20', market: 'FR' });
+    const data   = await spotifyGet('search?' + params.toString(), token);
     const tracks = (data.tracks?.items || []).map(normalizeSpotify);
     res.json({ status: 'success', results: tracks });
   } catch (e) { res.status(500).json({ error: e.message }); }
