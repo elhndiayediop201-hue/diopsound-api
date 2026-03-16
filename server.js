@@ -177,10 +177,12 @@ app.get('/search', async (req, res) => {
   const q = req.query.q;
   if (!q) return res.status(400).json({ error: 'q manquant' });
   try {
+    // Forcer un nouveau token à chaque fois (évite le cache périmé)
+    ccToken = null;
     const token  = await getClientToken();
     const data   = await spotifyGet(`search?q=${encodeURIComponent(q)}&type=track&limit=25&market=FR`, token);
+    console.log(`/search "${q}" → total:${data.tracks?.total} items:${data.tracks?.items?.length} error:${data.error?.status}`);
     const tracks = (data.tracks?.items || []).map(normalizeSpotify);
-    console.log(`/search "${q}" → ${tracks.length} résultats`);
     res.json({ status: 'success', results: tracks });
   } catch (e) {
     console.error('/search error:', e.message);
