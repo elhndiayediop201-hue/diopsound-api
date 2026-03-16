@@ -58,6 +58,22 @@ app.get('/health', (req, res) => {
   });
 });
 
+
+// DEBUG
+app.get('/debug-token', async (req, res) => {
+  try {
+    const creds = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+    const data  = await fetchJson('https://accounts.spotify.com/api/token', {
+      method:  'POST',
+      headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials',
+    });
+    res.json({ spotify_response: data, has_token: !!data.access_token });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════
 //  AUTH LOGIN
 // ══════════════════════════════════════════
